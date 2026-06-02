@@ -1,0 +1,13 @@
+services:
+  sharebox:
+    build: .
+    container_name: sharebox
+    restart: unless-stopped
+    ports:
+      - "3940:3940"
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data

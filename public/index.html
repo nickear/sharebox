@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ShareBox</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div class="top-actions">
+          <div class="lang-menu">
+            <button class="ghost lang-toggle" type="button" data-i18n-title="button.language" data-i18n-aria-label="button.language" title="Language" aria-label="Language" aria-haspopup="menu" aria-expanded="false">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="lang-icon">
+                <circle cx="12" cy="12" r="10"></circle>
+                <path d="M2 12h20"></path>
+                <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+              </svg>
+            </button>
+            <div class="lang-pop hidden" role="menu">
+              <button class="lang-option" type="button" data-lang-option="zh" role="menuitemradio" aria-checked="false">中文</button>
+              <button class="lang-option" type="button" data-lang-option="en" role="menuitemradio" aria-checked="false">English</button>
+            </div>
+          </div>
+          <button id="logoutBtn" class="ghost hidden icon-button" type="button" data-i18n-title="button.logout" data-i18n-aria-label="button.logout" title="Logout" aria-label="Logout">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+              <path d="m16 17 5-5-5-5"></path>
+              <path d="M21 12H9"></path>
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <div id="loginShell" class="hidden">
+        <div class="login-actions">
+          <div class="lang-menu">
+            <button class="ghost lang-toggle" type="button" data-i18n-title="button.language" data-i18n-aria-label="button.language" title="Language" aria-label="Language" aria-haspopup="menu" aria-expanded="false">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="lang-icon">
+                <circle cx="12" cy="12" r="10"></circle>
+                <path d="M2 12h20"></path>
+                <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+              </svg>
+            </button>
+            <div class="lang-pop hidden" role="menu">
+              <button class="lang-option" type="button" data-lang-option="zh" role="menuitemradio" aria-checked="false">中文</button>
+              <button class="lang-option" type="button" data-lang-option="en" role="menuitemradio" aria-checked="false">English</button>
+            </div>
+          </div>
+        </div>
+
+        <section id="loginPanel" class="panel login-panel">
+          <form id="loginForm" class="login-form">
+            <label>
+              <span data-i18n="label.password">Password</span>
+              <input id="loginPassword" name="password" type="password" autocomplete="current-password">
+            </label>
+            <button type="submit" data-i18n="button.login">Login</button>
+          </form>
+        </section>
+      </div>
+
+      <section id="appPanel" class="app-grid hidden">
+        <section class="panel composer">
+          <div class="tabs" role="tablist" data-i18n-aria-label="aria.share_mode" aria-label="Share mode">
+            <button id="textTab" class="tab active" type="button" data-i18n="tab.text">Text</button>
+            <button id="fileTab" class="tab" type="button" data-i18n="tab.files">Files</button>
+          </div>
+
+          <form id="textForm" class="composer-body">
+            <textarea id="textBody" name="text" rows="9" data-i18n-placeholder="placeholder.text_body" placeholder="Paste or type text here"></textarea>
+            <div class="form-actions">
+              <button type="submit" data-i18n="button.publish_text">Publish Text</button>
+              <button id="clearTextBtn" class="ghost" type="button" data-i18n="button.clear">Clear</button>
+            </div>
+          </form>
+
+          <form id="uploadForm" class="composer-body hidden">
+            <div id="dropZone" class="drop-zone">
+              <strong data-i18n="drop.title">Drop files or folders here</strong>
+              <span data-i18n="drop.subtitle">Use the buttons below if drag and drop is not available.</span>
+            </div>
+            <div class="file-buttons">
+              <label class="button-like">
+                <span data-i18n="button.choose_files">Choose Files</span>
+                <input id="fileInput" type="file" multiple>
+              </label>
+              <label class="button-like secondary">
+                <span data-i18n="button.choose_folder">Choose Folder</span>
+                <input id="folderInput" type="file" webkitdirectory directory multiple>
+              </label>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel list-panel">
+          <div class="list-head">
+            <span id="itemCount" class="item-count">0 items</span>
+            <div class="list-actions">
+              <button id="refreshBtn" class="ghost" type="button" data-i18n="button.refresh">Refresh</button>
+              <button id="clearAllBtn" class="danger" type="button" data-i18n="button.clear">Clear</button>
+            </div>
+          </div>
+          <div id="items" class="items"></div>
+          <div id="emptyState" class="empty-state hidden" data-i18n="empty.nothing">Nothing shared yet.</div>
+        </section>
+      </section>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
