@@ -28,6 +28,7 @@ const MAINTENANCE_INTERVAL_MS = 1000 * 60 * 10;
 const sessions = new Map();
 const eventClients = new Set();
 const failedLogins = new Map();
+const cancelledUploads = new Map();
 const serverMessages = {
   en: {
     'error.forbidden': 'forbidden',
@@ -116,6 +117,7 @@ function startMaintenance() {
   const timer = setInterval(() => {
     cleanupSessions();
     cleanupFailedLogins();
+    cleanupCancelledUploads();
   }, MAINTENANCE_INTERVAL_MS);
   timer.unref();
 }
@@ -174,6 +176,10 @@ async function handleRequest(req, res) {
 
   if (pathname === '/api/upload' && req.method === 'POST') {
     return handleUpload(req, res);
+  }
+
+  if (pathname === '/api/uploads/cancel' && req.method === 'POST') {
+    return handleCancelUpload(req, res);
   }
 
   const itemDownload = pathname.match(/^\/api\/items\/([^/]+)\/download$/);
@@ -280,6 +286,11 @@ async function handleUpload(req, res) {
     return sendJson(res, 400, { error: serverT(req, 'error.no_files_uploaded') });
   }
 
+  if (isUploadCancelled(parsed.uploadTaskId)) {
+    await rm(tempDir, { recursive: true, force: true });
+    return sendJson(res, 200, { ok: true, cancelled: true });
+  }
+
   await mkdir(groupDir, { recursive: true });
 
   const savedFiles = [];
@@ -309,12 +320,18 @@ async function handleUpload(req, res) {
 
   await rm(tempDir, { recursive: true, force: true });
 
+  if (isUploadCancelled(parsed.uploadTaskId)) {
+    await rm(groupDir, { recursive: true, force: true });
+    return sendJson(res, 200, { ok: true, cancelled: true });
+  }
+
   const now = new Date().toISOString();
   const item = {
     id,
     type: 'files',
     kind: inferFileKind(savedFiles),
     displayName: displayNameForFiles(savedFiles),
+    uploadTaskId: parsed.uploadTaskId || '',
     createdAt: now,
     updatedAt: now,
     files: savedFiles
@@ -322,9 +339,28 @@ async function handleUpload(req, res) {
 
   const db = await loadDb();
   db.items.push(item);
+  if (isUploadCancelled(parsed.uploadTaskId)) {
+    await rm(groupDir, { recursive: true, force: true });
+    return sendJson(res, 200, { ok: true, cancelled: true });
+  }
   await saveDb(db);
   broadcastEvent('items-updated');
   return sendJson(res, 201, { item: publicItem(item) });
+}
+
+async function handleCancelUpload(req, res) {
+  const body = await readJson(req);
+  const uploadTaskId = String(body.uploadTaskId || '').trim();
+  if (!uploadTaskId) {
+    return sendJson(res, 400, { error: serverT(req, 'error.not_found') });
+  }
+
+  markUploadCancelled(uploadTaskId);
+  const removed = await removeUploadTaskItems(uploadTaskId);
+  if (removed) {
+    broadcastEvent('items-updated');
+  }
+  return sendJson(res, 200, { ok: true });
 }
 
 async function handleItemDownload(req, res, id) {
@@ -505,6 +541,7 @@ function publicItem(item) {
     type: item.type,
     kind: item.kind || inferFileKind(item.files || []),
     displayName: item.displayName || displayNameForFiles(item.files || []),
+    uploadTaskId: item.uploadTaskId || '',
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
     fileCount: item.files?.length || 0,
@@ -686,6 +723,54 @@ function cleanupFailedLogins(now = Date.now()) {
   }
 }
 
+function markUploadCancelled(uploadTaskId) {
+  if (!uploadTaskId) {
+    return;
+  }
+  cancelledUploads.set(uploadTaskId, Date.now());
+}
+
+function isUploadCancelled(uploadTaskId) {
+  if (!uploadTaskId) {
+    return false;
+  }
+  return cancelledUploads.has(uploadTaskId);
+}
+
+async function removeUploadTaskItems(uploadTaskId) {
+  if (!uploadTaskId) {
+    return false;
+  }
+  const db = await loadDb();
+  const keptItems = [];
+  const removedItems = [];
+  for (const item of db.items) {
+    if (item.type === 'files' && item.uploadTaskId === uploadTaskId) {
+      removedItems.push(item);
+      continue;
+    }
+    keptItems.push(item);
+  }
+  if (!removedItems.length) {
+    return false;
+  }
+  db.items = keptItems;
+  await saveDb(db);
+  for (const item of removedItems) {
+    await rm(path.join(UPLOAD_DIR, item.id), { recursive: true, force: true });
+  }
+  return true;
+}
+
+function cleanupCancelledUploads(now = Date.now()) {
+  const ttl = 1000 * 60 * 60;
+  for (const [uploadTaskId, createdAt] of cancelledUploads) {
+    if (now - createdAt > ttl) {
+      cancelledUploads.delete(uploadTaskId);
+    }
+  }
+}
+
 async function readJson(req) {
   const chunks = [];
   let size = 0;
@@ -725,7 +810,8 @@ async function parseMultipartUpload(req, contentType, tempDir) {
   const result = {
     files: [],
     paths: [],
-    fieldBytes: 0
+    fieldBytes: 0,
+    uploadTaskId: ''
   };
 
   try {
@@ -979,6 +1065,10 @@ async function finalizeMultipartPart(part, result) {
   const value = Buffer.concat(part.chunks).toString('utf8');
   if (part.name === 'paths') {
     result.paths.push(value);
+    return;
+  }
+  if (part.name === 'uploadTaskId' && !result.uploadTaskId) {
+    result.uploadTaskId = value;
   }
 }
 

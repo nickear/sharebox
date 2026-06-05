@@ -4,10 +4,13 @@ const state = {
   authenticated: false,
   itemTexts: new Map(),
   items: [],
+  pendingUploads: [],
   busy: false,
+  currentUploadTaskId: null,
   eventSource: null,
   reloadScheduled: false,
-  pendingReload: false
+  pendingReload: false,
+  mutationRefreshTimer: null
 };
 
 const messages = {
@@ -19,6 +22,9 @@ const messages = {
     'button.language': 'Language',
     'button.publish_text': 'Publish Text',
     'button.clear': 'Clear',
+    'button.pause': 'Pause',
+    'button.resume': 'Resume',
+    'button.cancel': 'Cancel',
     'button.choose_files': 'Choose Files',
     'button.choose_folder': 'Choose Folder',
     'button.refresh': 'Refresh',
@@ -35,9 +41,13 @@ const messages = {
     'toast.cleared': 'Cleared',
     'toast.refreshing': 'Refreshing...',
     'toast.refresh_complete': 'Refreshed',
+    'toast.cancel_failed': 'Cancel failed. Please try again.',
     'toast.text_empty': 'Text is empty',
     'toast.text_published': 'Text published',
     'toast.upload_complete': 'Upload complete',
+    'upload.uploading': 'Uploading {percent}% · {loaded} / {size}',
+    'upload.queued': 'Queued',
+    'upload.paused': 'Paused',
     'confirm.delete_item': 'Delete this item?',
     'confirm.clear_all': 'Clear all items?',
     'item.text': 'Text',
@@ -56,6 +66,9 @@ const messages = {
     'button.language': '语言',
     'button.publish_text': '发送文本',
     'button.clear': '清空',
+    'button.pause': '暂停',
+    'button.resume': '继续',
+    'button.cancel': '取消',
     'button.choose_files': '选择文件',
     'button.choose_folder': '选择文件夹',
     'button.refresh': '刷新',
@@ -72,9 +85,13 @@ const messages = {
     'toast.cleared': '已清空',
     'toast.refreshing': '正在刷新...',
     'toast.refresh_complete': '已刷新',
+    'toast.cancel_failed': '取消失败，请重试',
     'toast.text_empty': '文本为空',
     'toast.text_published': '文本已发送',
     'toast.upload_complete': '上传完成',
+    'upload.uploading': '正在上传 {percent}% · {loaded} / {size}',
+    'upload.queued': '排队中',
+    'upload.paused': '已暂停',
     'confirm.delete_item': '确定删除这项内容吗？',
     'confirm.clear_all': '确定清空全部内容吗？',
     'item.text': '文本',
@@ -165,6 +182,22 @@ function bindEvents() {
   els.dropZone.addEventListener('drop', handleDrop);
 
   els.items.addEventListener('click', async (event) => {
+    const uploadAction = event.target.closest('[data-upload-action]');
+    if (uploadAction) {
+      const taskId = uploadAction.dataset.uploadId;
+      const type = uploadAction.dataset.uploadAction;
+      if (type === 'pause') {
+        pauseUploadTask(taskId);
+      }
+      if (type === 'resume') {
+        resumeUploadTask(taskId);
+      }
+      if (type === 'cancel') {
+        void cancelUploadTask(taskId);
+      }
+      return;
+    }
+
     const action = event.target.closest('[data-action]');
     if (!action) {
       return;
@@ -186,7 +219,7 @@ function bindEvents() {
       }
       await apiFetch(`/api/items/${itemId}`, { method: 'DELETE' });
       showToast(t('toast.deleted'));
-      await loadItems();
+      scheduleMutationRefreshFallback();
     }
   });
 }
@@ -315,7 +348,7 @@ async function handleClearAll() {
   try {
     await apiFetch('/api/items', { method: 'DELETE' });
     showToast(t('toast.cleared'));
-    await loadItems();
+    scheduleMutationRefreshFallback();
   } catch (error) {
     showToast(error.message);
   } finally {
@@ -351,7 +384,7 @@ async function handleTextSubmit(event) {
     });
     els.textBody.value = '';
     showToast(t('toast.text_published'));
-    await loadItems();
+    scheduleMutationRefreshFallback();
   } catch (error) {
     showToast(error.message);
   } finally {
@@ -402,27 +435,71 @@ async function uploadEntries(entries) {
   }
 
   const groups = groupUploadEntries(uniqueEntries);
+  const tasks = createUploadTasks(groups);
+  state.pendingUploads.push(...tasks);
+  renderList();
+  syncBusyState();
+  void processUploadQueue();
+}
 
-  setBusy(true);
-  try {
-    for (const group of groups) {
-      const form = new FormData();
-      for (const entry of group) {
-        form.append('files', entry.file, entry.file.name);
-        form.append('paths', entry.path || entry.file.name);
-      }
-      await apiFetch('/api/upload', {
-        method: 'POST',
-        body: form
-      });
+function uploadGroup(task, onProgress) {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.append('uploadTaskId', task.id);
+    for (const entry of task.entries) {
+      form.append('files', entry.file, entry.file.name);
+      form.append('paths', entry.path || entry.file.name);
     }
-    showToast(t('toast.upload_complete'));
-    await loadItems();
-  } catch (error) {
-    showToast(error.message);
-  } finally {
-    setBusy(false);
-  }
+
+    const xhr = new XMLHttpRequest();
+    task.xhr = xhr;
+    xhr.open('POST', '/api/upload');
+    xhr.setRequestHeader('X-Lang', state.lang);
+    xhr.responseType = 'text';
+
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        onProgress(event.loaded);
+      }
+    };
+
+    xhr.onerror = () => {
+      task.xhr = null;
+      reject(new Error('Network error'));
+    };
+
+    xhr.onabort = () => {
+      task.xhr = null;
+      const error = new Error(task.abortReason || 'Upload aborted');
+      error.code = task.abortReason || 'abort';
+      reject(error);
+    };
+
+    xhr.onload = () => {
+      const type = xhr.getResponseHeader('content-type') || '';
+      let body = xhr.responseText;
+      if (type.includes('application/json') && xhr.responseText) {
+        try {
+          body = JSON.parse(xhr.responseText);
+        } catch {
+          body = xhr.responseText;
+        }
+      }
+      if (xhr.status < 200 || xhr.status >= 300) {
+        const message = typeof body === 'object' && body?.error ? body.error : `HTTP ${xhr.status}`;
+        const error = new Error(message);
+        error.status = xhr.status;
+        task.xhr = null;
+        reject(error);
+        return;
+      }
+      task.xhr = null;
+      onProgress(task.totalBytes);
+      resolve(body);
+    };
+
+    xhr.send(form);
+  });
 }
 
 async function readDroppedEntry(entry, basePath) {
@@ -480,6 +557,167 @@ function groupUploadEntries(entries) {
   return [...fileGroups, ...folderGroups.values()];
 }
 
+function createUploadTasks(groups) {
+  return groups.map((group) => {
+    const first = group[0];
+    const normalizedPath = String(first.path || first.file.name || '').replace(/\\/g, '/');
+    const parts = normalizedPath.split('/').filter(Boolean);
+    const isFolder = parts.length > 1;
+    return {
+      id: crypto.randomUUID(),
+      kind: isFolder ? 'folder' : 'file',
+      displayName: isFolder ? parts[0] : (first.file.name || normalizedPath || t('item.file')),
+      createdAt: new Date().toISOString(),
+      totalBytes: group.reduce((sum, entry) => sum + Number(entry.file.size || 0), 0),
+      entries: group,
+      uploadedBytes: 0,
+      status: 'queued',
+      xhr: null,
+      abortReason: ''
+    };
+  });
+}
+
+function updatePendingUpload(id, patch, options = {}) {
+  const task = state.pendingUploads.find((item) => item.id === id);
+  if (!task) {
+    return;
+  }
+  Object.assign(task, patch);
+  if (options.replace) {
+    replacePendingUploadDom(task);
+    return;
+  }
+  patchPendingUploadDom(task);
+}
+
+function removePendingUpload(id) {
+  const next = state.pendingUploads.filter((item) => item.id !== id);
+  if (next.length === state.pendingUploads.length) {
+    return;
+  }
+  state.pendingUploads = next;
+  renderList();
+}
+
+async function processUploadQueue() {
+  if (state.currentUploadTaskId) {
+    return;
+  }
+
+  const task = state.pendingUploads.find((item) => item.status === 'queued');
+  if (!task) {
+    syncBusyState();
+    return;
+  }
+
+  state.currentUploadTaskId = task.id;
+  updatePendingUpload(task.id, {
+    status: 'uploading',
+    uploadedBytes: 0,
+    abortReason: ''
+  }, { replace: true });
+  syncBusyState();
+
+  try {
+    const result = await uploadGroup(task, (loaded) => {
+      updatePendingUpload(task.id, {
+        status: 'uploading',
+        uploadedBytes: loaded
+      });
+    });
+    if (result?.cancelled) {
+      removePendingUpload(task.id);
+      return;
+    }
+    removePendingUpload(task.id);
+    scheduleMutationRefreshFallback();
+    showToast(t('toast.upload_complete'));
+  } catch (error) {
+    const current = state.pendingUploads.find((item) => item.id === task.id);
+    if (current?.abortReason === 'pause') {
+      updatePendingUpload(task.id, {
+        status: 'paused',
+        uploadedBytes: 0,
+        xhr: null,
+        abortReason: ''
+      }, { replace: true });
+    } else if (current?.abortReason === 'cancel') {
+      removePendingUpload(task.id);
+    } else {
+      removePendingUpload(task.id);
+      showToast(error.message);
+    }
+  } finally {
+    if (state.currentUploadTaskId === task.id) {
+      state.currentUploadTaskId = null;
+    }
+    syncBusyState();
+    void processUploadQueue();
+  }
+}
+
+function pauseUploadTask(id) {
+  const task = state.pendingUploads.find((item) => item.id === id);
+  if (!task) {
+    return;
+  }
+  if (task.status === 'queued') {
+    updatePendingUpload(id, { status: 'paused' }, { replace: true });
+    syncBusyState();
+    return;
+  }
+  if (task.status === 'uploading' && task.xhr) {
+    task.abortReason = 'pause';
+    task.xhr.abort();
+  }
+}
+
+function resumeUploadTask(id) {
+  const task = state.pendingUploads.find((item) => item.id === id);
+  if (!task || task.status !== 'paused') {
+    return;
+  }
+  updatePendingUpload(id, {
+    status: 'queued',
+    uploadedBytes: 0,
+    abortReason: ''
+  }, { replace: true });
+  syncBusyState();
+  void processUploadQueue();
+}
+
+async function cancelUploadTask(id) {
+  const task = state.pendingUploads.find((item) => item.id === id);
+  if (!task) {
+    return;
+  }
+  let cancelled = false;
+  try {
+    await notifyUploadCancelled(id);
+    cancelled = true;
+  } catch {
+    showToast(t('toast.cancel_failed'));
+  }
+  if (!cancelled) {
+    return;
+  }
+  scheduleMutationRefreshFallback();
+  if (task.status === 'uploading' && task.xhr) {
+    task.abortReason = 'cancel';
+    task.xhr.abort();
+    return;
+  }
+  removePendingUpload(id);
+  syncBusyState();
+  void processUploadQueue();
+}
+
+function syncBusyState() {
+  const hasActiveQueueWork = state.pendingUploads.some((item) => item.status === 'queued' || item.status === 'uploading');
+  setBusy(hasActiveQueueWork);
+}
+
 async function loadItems(options = {}) {
   if (state.authRequired && !state.authenticated) {
     return;
@@ -487,6 +725,7 @@ async function loadItems(options = {}) {
 
   try {
     const data = await apiFetch('/api/items');
+    clearMutationRefreshFallback();
     renderItems(data.items || []);
     if (options.showRefreshedToast) {
       showToast(t('toast.refresh_complete'));
@@ -502,18 +741,96 @@ async function loadItems(options = {}) {
 }
 
 function renderItems(items) {
+  const completedTaskIds = new Set(items.map((item) => item.uploadTaskId).filter(Boolean));
+  if (completedTaskIds.size) {
+    state.pendingUploads = state.pendingUploads.filter((task) => !completedTaskIds.has(task.id));
+  }
   state.items = items;
   state.itemTexts = new Map(items.filter((item) => item.type === 'text').map((item) => [item.id, item.text || '']));
-  els.itemCount.textContent = formatItemCount(items.length);
-  els.emptyState.classList.toggle('hidden', items.length > 0);
-  els.items.innerHTML = items.map(renderItem).join('');
+  renderList();
+}
+
+function renderList() {
+  const totalCount = state.pendingUploads.length + state.items.length;
+  els.itemCount.textContent = formatItemCount(totalCount);
+  els.emptyState.classList.toggle('hidden', totalCount > 0);
+  els.items.innerHTML = [
+    ...state.pendingUploads.map(renderPendingUpload),
+    ...state.items.map(renderItem)
+  ].join('');
+}
+
+function renderPendingUpload(task) {
+  const label = task.kind === 'folder' ? t('item.folder') : t('item.file');
+  const percent = task.totalBytes > 0 ? Math.min(100, Math.round((task.uploadedBytes / task.totalBytes) * 100)) : 0;
+  const text = task.status === 'queued'
+    ? t('upload.queued')
+    : task.status === 'paused'
+      ? t('upload.paused')
+      : t('upload.uploading', {
+          percent,
+          loaded: formatBytes(task.uploadedBytes),
+          size: formatBytes(task.totalBytes)
+        });
+  // Keep pause/resume logic in code for later, but hide those controls for now.
+  const controls = `
+    <button class="danger upload-control" type="button" data-upload-action="cancel" data-upload-id="${task.id}">${t('button.cancel')}</button>
+  `;
+
+  return `
+    <article class="item" data-pending-upload-id="${task.id}">
+      ${renderItemMeta(task, label, task.totalBytes || 0, 'files', { showDate: false })}
+      <div class="item-content file-content">${escapeHtml(task.displayName)}</div>
+      <div class="item-progress-row">
+        <div class="item-progress ${task.status === 'queued' ? 'queued' : ''} ${task.status === 'paused' ? 'paused' : ''}">
+          <div class="item-progress-fill" style="width: ${percent}%"></div>
+          <div class="item-progress-text">${escapeHtml(text)}</div>
+        </div>
+        <div class="item-progress-actions">${controls}</div>
+      </div>
+    </article>
+  `;
+}
+
+function replacePendingUploadDom(task) {
+  const current = els.items.querySelector(`[data-pending-upload-id="${task.id}"]`);
+  if (!current) {
+    renderList();
+    return;
+  }
+  current.outerHTML = renderPendingUpload(task);
+}
+
+function patchPendingUploadDom(task) {
+  const current = els.items.querySelector(`[data-pending-upload-id="${task.id}"]`);
+  if (!current) {
+    return;
+  }
+  const percent = task.totalBytes > 0 ? Math.min(100, Math.round((task.uploadedBytes / task.totalBytes) * 100)) : 0;
+  const text = task.status === 'queued'
+    ? t('upload.queued')
+    : task.status === 'paused'
+      ? t('upload.paused')
+      : t('upload.uploading', {
+          percent,
+          loaded: formatBytes(task.uploadedBytes),
+          size: formatBytes(task.totalBytes)
+        });
+  current.querySelector('.item-progress-fill')?.setAttribute('style', `width: ${percent}%`);
+  const progress = current.querySelector('.item-progress');
+  progress?.classList.toggle('queued', task.status === 'queued');
+  progress?.classList.toggle('paused', task.status === 'paused');
+  const textNode = current.querySelector('.item-progress-text');
+  if (textNode) {
+    textNode.textContent = text;
+  }
 }
 
 function renderItem(item) {
   if (item.type === 'text') {
     return `
       <article class="item">
-        ${renderItemMeta(item, t('item.text'), item.size || 0)}
+        ${renderItemMeta(item, t('item.text'), item.size || 0, item.type)}
         <div class="item-content text-content">${escapeHtml(item.text || '')}</div>
         <div class="item-actions">
           <button class="ghost" type="button" data-action="copy" data-id="${item.id}">${t('item.copy')}</button>
@@ -531,7 +848,7 @@ function renderItem(item) {
 
   return `
     <article class="item">
-      ${renderItemMeta(item, label, item.totalSize || 0)}
+      ${renderItemMeta(item, label, item.totalSize || 0, item.type)}
       <div class="item-content file-content">${escapeHtml(contentName)}</div>
       <div class="item-actions">
         <a class="button-link" href="${item.downloadUrl}">${downloadText}</a>
@@ -541,12 +858,13 @@ function renderItem(item) {
   `;
 }
 
-function renderItemMeta(item, label, size) {
+function renderItemMeta(item, label, size, type, options = {}) {
+  const showDate = options.showDate !== false;
   return `
     <div class="item-meta-row">
-      <span class="badge ${label === 'Text' ? '' : 'files'}">${label}</span>
+      <span class="badge ${type === 'text' ? '' : 'files'}">${label}</span>
       <span>${formatBytes(size)}</span>
-      <span class="meta-date">${formatDate(item.createdAt)}</span>
+      ${showDate ? `<span class="meta-date">${formatDate(item.createdAt)}</span>` : ''}
     </div>
   `;
 }
@@ -571,9 +889,39 @@ async function apiFetch(url, options = {}) {
   return body;
 }
 
+function notifyUploadCancelled(uploadTaskId) {
+  return apiFetch('/api/uploads/cancel', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ uploadTaskId })
+  });
+}
+
+function scheduleMutationRefreshFallback() {
+  clearMutationRefreshFallback();
+  state.mutationRefreshTimer = setTimeout(async () => {
+    state.mutationRefreshTimer = null;
+    if (state.authRequired && !state.authenticated) {
+      return;
+    }
+    await loadItems();
+  }, 1200);
+}
+
+function clearMutationRefreshFallback() {
+  if (!state.mutationRefreshTimer) {
+    return;
+  }
+  clearTimeout(state.mutationRefreshTimer);
+  state.mutationRefreshTimer = null;
+}
+
 function setBusy(busy) {
   state.busy = busy;
   for (const element of document.querySelectorAll('button')) {
+    if (element.classList.contains('upload-control')) {
+      continue;
+    }
     element.disabled = busy;
   }
   for (const element of document.querySelectorAll('.button-like')) {
@@ -696,6 +1044,7 @@ function handleDocumentClick(event) {
   closeLangMenus();
 }
 
+
 function formatBytes(bytes) {
   const value = Number(bytes || 0);
   if (value < 1024) {
@@ -712,13 +1061,17 @@ function formatBytes(bytes) {
 }
 
 function formatDate(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
   return new Intl.DateTimeFormat(undefined, {
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit'
-  }).format(new Date(value));
+  }).format(date);
 }
 
 function escapeHtml(value) {
