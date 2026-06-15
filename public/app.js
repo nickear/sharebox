@@ -1,3 +1,5 @@
+const MAX_UPLOAD_FILES = 10000;
+
 const state = {
   lang: getInitialLang(),
   authRequired: false,
@@ -43,6 +45,7 @@ const messages = {
     'toast.refresh_complete': 'Refreshed',
     'toast.cancel_failed': 'Cancel failed. Please try again.',
     'toast.text_empty': 'Text is empty',
+    'toast.too_many_files': 'Too many files. Upload at most {count} files at a time.',
     'toast.text_published': 'Text published',
     'toast.upload_complete': 'Upload complete',
     'upload.uploading': 'Uploading {percent}% · {loaded} / {size}',
@@ -87,6 +90,7 @@ const messages = {
     'toast.refresh_complete': '已刷新',
     'toast.cancel_failed': '取消失败，请重试',
     'toast.text_empty': '文本为空',
+    'toast.too_many_files': '文件数量过多，每次最多上传 {count} 个文件',
     'toast.text_published': '文本已发送',
     'toast.upload_complete': '上传完成',
     'upload.uploading': '正在上传 {percent}% · {loaded} / {size}',
@@ -162,8 +166,8 @@ function bindEvents() {
     els.textBody.focus();
   });
 
-  els.fileInput.addEventListener('change', () => addFileList([...els.fileInput.files]));
-  els.folderInput.addEventListener('change', () => addFileList([...els.folderInput.files]));
+  els.fileInput.addEventListener('change', () => addFileList(els.fileInput.files));
+  els.folderInput.addEventListener('change', () => addFileList(els.folderInput.files));
 
   for (const eventName of ['dragenter', 'dragover']) {
     els.dropZone.addEventListener(eventName, (event) => {
@@ -393,27 +397,59 @@ async function handleTextSubmit(event) {
 }
 
 async function handleDrop(event) {
-  const items = [...event.dataTransfer.items || []];
-  if (items.length && items.some((item) => item.webkitGetAsEntry)) {
-    const entries = [];
-    for (const item of items) {
-      const entry = item.webkitGetAsEntry?.();
+  const items = event.dataTransfer.items || [];
+  let hasEntryItems = false;
+  for (let index = 0; index < items.length; index += 1) {
+    if (items[index]?.webkitGetAsEntry) {
+      hasEntryItems = true;
+      break;
+    }
+  }
+
+  if (items.length && hasEntryItems) {
+    if (items.length > MAX_UPLOAD_FILES) {
+      showToast(t('toast.too_many_files', { count: MAX_UPLOAD_FILES }));
+      return;
+    }
+
+    const droppedEntries = [];
+    for (let index = 0; index < items.length; index += 1) {
+      const entry = items[index].webkitGetAsEntry?.();
       if (entry) {
-        entries.push(...await readDroppedEntry(entry, ''));
+        droppedEntries.push(entry);
+      }
+    }
+
+    const entries = [];
+    for (const entry of droppedEntries) {
+      const withinLimit = await collectDroppedEntry(entry, '', entries);
+      if (!withinLimit) {
+        showToast(t('toast.too_many_files', { count: MAX_UPLOAD_FILES }));
+        return;
       }
     }
     await uploadEntries(entries);
     return;
   }
 
-  await addFileList([...event.dataTransfer.files || []]);
+  await addFileList(event.dataTransfer.files || []);
 }
 
 async function addFileList(files) {
-  const entries = files.map((file) => ({
-    file,
-    path: file.webkitRelativePath || file.name
-  }));
+  if (files.length > MAX_UPLOAD_FILES) {
+    els.fileInput.value = '';
+    els.folderInput.value = '';
+    showToast(t('toast.too_many_files', { count: MAX_UPLOAD_FILES }));
+    return;
+  }
+
+  const entries = [];
+  for (const file of files) {
+    entries.push({
+      file,
+      path: file.webkitRelativePath || file.name
+    });
+  }
   els.fileInput.value = '';
   els.folderInput.value = '';
   await uploadEntries(entries);
@@ -431,6 +467,11 @@ async function uploadEntries(entries) {
   }
 
   if (!uniqueEntries.length) {
+    return;
+  }
+
+  if (uniqueEntries.length > MAX_UPLOAD_FILES) {
+    showToast(t('toast.too_many_files', { count: MAX_UPLOAD_FILES }));
     return;
   }
 
@@ -502,33 +543,33 @@ function uploadGroup(task, onProgress) {
   });
 }
 
-async function readDroppedEntry(entry, basePath) {
+async function collectDroppedEntry(entry, basePath, entries) {
   if (entry.isFile) {
     const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
-    return [{ file, path: joinWebPath(basePath, file.name) }];
+    entries.push({ file, path: joinWebPath(basePath, file.name) });
+    return entries.length <= MAX_UPLOAD_FILES;
   }
 
   if (entry.isDirectory) {
     const nextBase = joinWebPath(basePath, entry.name);
     const reader = entry.createReader();
-    const children = [];
 
     while (true) {
       const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
       if (!batch.length) {
         break;
       }
-      children.push(...batch);
+      for (const child of batch) {
+        const withinLimit = await collectDroppedEntry(child, nextBase, entries);
+        if (!withinLimit) {
+          return false;
+        }
+      }
     }
-
-    const files = [];
-    for (const child of children) {
-      files.push(...await readDroppedEntry(child, nextBase));
-    }
-    return files;
+    return true;
   }
 
-  return [];
+  return true;
 }
 
 function joinWebPath(basePath, name) {

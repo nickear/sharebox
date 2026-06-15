@@ -14,6 +14,7 @@ const DB_PATH = path.join(DATA_DIR, 'items.json');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const MAX_JSON_BYTES = Number(process.env.MAX_JSON_BYTES || 1024 * 1024);
 const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
+const MAX_UPLOAD_FILES = 10000;
 const MAX_UPLOAD_FIELD_BYTES = 16 * 1024;
 const MAX_UPLOAD_FIELDS_BYTES = 1024 * 1024;
 const SHAREBOX_PASSWORD = process.env.SHAREBOX_PASSWORD || '';
@@ -42,6 +43,7 @@ const serverMessages = {
     'error.invalid_json': 'invalid json',
     'error.missing_multipart_boundary': 'missing multipart boundary',
     'error.upload_too_large': 'upload is too large',
+    'error.too_many_files': `too many files, upload at most ${MAX_UPLOAD_FILES} files at a time`,
     'error.invalid_multipart_payload': 'invalid multipart payload',
     'error.upload_metadata_too_large': 'upload metadata is too large',
     'error.internal_server_error': 'internal server error'
@@ -58,6 +60,7 @@ const serverMessages = {
     'error.invalid_json': 'JSON 格式无效',
     'error.missing_multipart_boundary': '缺少 multipart boundary',
     'error.upload_too_large': '上传内容过大',
+    'error.too_many_files': `文件数量过多，每次最多上传 ${MAX_UPLOAD_FILES} 个文件`,
     'error.invalid_multipart_payload': 'multipart 请求无效',
     'error.upload_metadata_too_large': '上传元数据过大',
     'error.internal_server_error': '服务器内部错误'
@@ -382,6 +385,10 @@ async function handleItemDownload(req, res, id) {
 
   if (!item.files?.length) {
     return sendJson(res, 404, { error: serverT(req, 'error.not_found') });
+  }
+
+  if (item.files.length > MAX_UPLOAD_FILES) {
+    return sendJson(res, 413, { error: serverT(req, 'error.too_many_files') });
   }
 
   if (item.files.length === 1) {
@@ -1043,6 +1050,13 @@ async function finalizeMultipartPart(part, result) {
       });
     });
     if (part.name === 'files') {
+      if (result.files.length >= MAX_UPLOAD_FILES) {
+        await rm(part.tempPath, { force: true });
+        throw Object.assign(new Error('too many files'), {
+          statusCode: 413,
+          publicMessageKey: 'error.too_many_files'
+        });
+      }
       result.files.push({
         tempPath: part.tempPath,
         originalName: part.filename,
